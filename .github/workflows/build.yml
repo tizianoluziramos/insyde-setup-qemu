@@ -56,7 +56,14 @@ jobs:
             https://download.qemu.org/qemu-10.0.0.tar.xz \
             --output qemu-10.0.0.tar.xz
 
-          tar -xJf qemu-10.0.0.tar.xz
+          tar -xJf qemu-10.0.0.tar.xz \
+            --exclude='qemu-10.0.0/roms/u-boot' \
+            --exclude='qemu-10.0.0/roms/skiboot/opal-ci' \
+            --exclude='qemu-10.0.0/tests/lcitool' \
+            --exclude='qemu-10.0.0/roms/edk2/EmulatorPkg/Unix/Host/X11IncludeHack'
+
+          test -f qemu-10.0.0/configure
+          test -f qemu-10.0.0/pc-bios/vgabios-stdvga.bin
 
       - name: Validar y aplicar el parche
         run: |
