@@ -1,0 +1,156 @@
+name: Compilar QEMU para Windows
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - amd-platform-q35.patch
+      - .github/workflows/build-qemu-windows.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar MSYS2 y MinGW
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            curl
+            tar
+            xz
+            patch
+            diffutils
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-glib2
+            mingw-w64-x86_64-pixman
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+
+      - name: Descargar QEMU 10.0.0
+        run: |
+          set -euo pipefail
+
+          test -f amd-platform-q35.patch
+
+          curl --fail --location --retry 3 \
+            https://download.qemu.org/qemu-10.0.0.tar.xz \
+            --output qemu-10.0.0.tar.xz
+
+          tar -xJf qemu-10.0.0.tar.xz
+
+      - name: Validar y aplicar el parche
+        run: |
+          set -euo pipefail
+          cd qemu-10.0.0
+
+          patch --batch --forward --dry-run -p1 \
+            < ../amd-platform-q35.patch
+
+          patch --batch --forward -p1 \
+            < ../amd-platform-q35.patch
+
+      - name: Configurar compilación
+        run: |
+          set -euo pipefail
+
+          mkdir -p qemu-10.0.0/build
+          cd qemu-10.0.0/build
+
+          ../configure \
+            --target-list=x86_64-softmmu \
+            --python=/mingw64/bin/python.exe \
+            --without-default-features \
+            --enable-tcg \
+            --enable-pixman \
+            --disable-docs \
+            --disable-werror
+
+      - name: Compilar QEMU
+        run: |
+          set -euo pipefail
+          cd qemu-10.0.0/build
+
+          ninja -j 2 qemu-system-x86_64.exe
+
+      - name: Preparar paquete para Windows
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist/qemu-windows/share
+          mkdir -p dist/qemu-windows/licencias
+
+          cp qemu-10.0.0/build/qemu-system-x86_64.exe \
+            dist/qemu-windows/
+
+          strip --strip-unneeded \
+            dist/qemu-windows/qemu-system-x86_64.exe
+
+          # Incluir las DLL del entorno usado para compilar.
+          # Esto también incorpora dependencias transitivas.
+          cp /mingw64/bin/*.dll dist/qemu-windows/
+
+          # Recursos que QEMU busca mediante su opción -L.
+          cp -R qemu-10.0.0/pc-bios/. dist/qemu-windows/share/
+
+          cp qemu-10.0.0/COPYING \
+            dist/qemu-windows/licencias/QEMU-COPYING.txt
+
+          cp amd-platform-q35.patch dist/qemu-windows/
+
+          # Conservar las licencias de los paquetes MinGW.
+          for directory in /mingw64/share/licenses/*; do
+            if [ -d "$directory" ]; then
+              cp -R "$directory" dist/qemu-windows/licencias/
+            fi
+          done
+
+      - name: Comprobar ejecutable y opciones del parche
+        run: |
+          set -euo pipefail
+          cd dist/qemu-windows
+
+          ./qemu-system-x86_64.exe --version
+
+          ./qemu-system-x86_64.exe -cpu help \
+            > cpu-help.txt 2>&1
+
+          ./qemu-system-x86_64.exe -device ICH9-LPC,help \
+            > ich9-help.txt 2>&1
+
+          grep -F "amd-pmio" ich9-help.txt
+          grep -F "ec-unavailable" ich9-help.txt
+
+      - name: Publicar QEMU para Windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: QEMU-10.0.0-Windows-x64-PCD
+          path: dist/qemu-windows/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publicar fuentes usadas
+        uses: actions/upload-artifact@v4
+        with:
+          name: QEMU-10.0.0-Fuentes-y-parche
+          path: |
+            qemu-10.0.0.tar.xz
+            amd-platform-q35.patch
+          if-no-files-found: error
+          retention-days: 30

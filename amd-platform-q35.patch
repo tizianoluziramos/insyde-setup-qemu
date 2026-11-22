@@ -1,0 +1,229 @@
+--- a/hw/isa/lpc_ich9.c
++++ b/hw/isa/lpc_ich9.c
+@@ -611,6 +611,8 @@
+ 
+     lpc->sci_level = 0;
+     lpc->rst_cnt = 0;
++    lpc->amd_pmio_index = 0;
++    lpc->ec_remaining = 0;
+ 
+     memset(lpc->smi_guest_features_le, 0, sizeof lpc->smi_guest_features_le);
+     lpc->smi_features_ok = 0;
+@@ -673,6 +675,89 @@
+     .read = ich9_rst_cnt_read,
+     .write = ich9_rst_cnt_write,
+     .endianness = DEVICE_LITTLE_ENDIAN
++};
++
++/* Expose the actual Q35 ACPI PM timer through the AMD PMIO index registers. */
++static uint64_t ich9_amd_pmio_read(void *opaque, hwaddr addr, unsigned len)
++{
++    ICH9LPCState *lpc = opaque;
++    unsigned timer_port = lpc->pm.pm_io_base ? lpc->pm.pm_io_base + 8 : 0;
++
++    if (addr == 0) {
++        return lpc->amd_pmio_index;
++    }
++    if (lpc->amd_pmio_index == 0x64) {
++        return timer_port & 0xff;
++    }
++    if (lpc->amd_pmio_index == 0x65) {
++        return timer_port >> 8;
++    }
++    return 0xff;
++}
++
++static void ich9_amd_pmio_write(void *opaque, hwaddr addr, uint64_t data,
++                                unsigned len)
++{
++    ICH9LPCState *lpc = opaque;
++
++    if (addr == 0) {
++        lpc->amd_pmio_index = data;
++    }
++}
++
++static const MemoryRegionOps ich9_amd_pmio_ops = {
++    .read = ich9_amd_pmio_read,
++    .write = ich9_amd_pmio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 1,
++};
++
++/* Diagnostic-only absent EC transport. Payloads remain unmapped (0xff). */
++static uint64_t ec_absent_status(void *opaque, hwaddr addr, unsigned len)
++{
++    ICH9LPCState *lpc = opaque;
++    /* Output buffer full while the unavailable reply can be drained. */
++    return lpc->ec_remaining ? 1 : 0;
++}
++
++static uint64_t ec_absent_data(void *opaque, hwaddr addr, unsigned len)
++{
++    ICH9LPCState *lpc = opaque;
++    if (lpc->ec_remaining) {
++        --lpc->ec_remaining;
++    }
++    return 0xff;
++}
++
++static void ec_absent_command(void *opaque, hwaddr addr, uint64_t data,
++                              unsigned len)
++{
++    ICH9LPCState *lpc = opaque;
++    /* Bound the reply window for the vendor's multi-byte EEPROM queries.
++     * The guest receives only the open-bus value, never board data. */
++    lpc->ec_remaining = 32;
++}
++
++static void ec_absent_write(void *opaque, hwaddr addr, uint64_t data,
++                            unsigned len)
++{
++}
++
++static const MemoryRegionOps ec_absent_command_ops = {
++    .read = ec_absent_status,
++    .write = ec_absent_command,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 1,
++};
++
++static const MemoryRegionOps ec_absent_data_ops = {
++    .read = ec_absent_data,
++    .write = ec_absent_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 1,
+ };
+ 
+ static void ich9_lpc_initfn(Object *obj)
+@@ -763,6 +848,22 @@
+     pci_bus_set_route_irq_fn(pci_bus, ich9_route_intx_pin_to_irq);
+ 
+     ich9_lpc_pm_init(lpc);
++    if (lpc->ec_unavailable) {
++        memory_region_init_io(&lpc->ec_command, OBJECT(lpc),
++                              &ec_absent_command_ops, lpc, "ec-status", 1);
++        memory_region_init_io(&lpc->ec_data, OBJECT(lpc),
++                              &ec_absent_data_ops, lpc, "ec-data", 1);
++        memory_region_add_subregion(pci_address_space_io(d), 0x66,
++                                    &lpc->ec_command);
++        memory_region_add_subregion(pci_address_space_io(d), 0x62,
++                                    &lpc->ec_data);
++    }
++    if (lpc->amd_pmio) {
++        memory_region_init_io(&lpc->amd_pmio_io, OBJECT(lpc),
++                              &ich9_amd_pmio_ops, lpc, "amd-pmio-timer", 2);
++        memory_region_add_subregion(pci_address_space_io(d), 0xcd6,
++                                    &lpc->amd_pmio_io);
++    }
+ }
+ 
+ static bool ich9_rst_cnt_needed(void *opaque)
+@@ -802,6 +903,40 @@
+                             sizeof(uint64_t)),
+         VMSTATE_UINT8(smi_features_ok, ICH9LPCState),
+         VMSTATE_UINT64(smi_negotiated_features, ICH9LPCState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static bool ich9_amd_pmio_needed(void *opaque)
++{
++    ICH9LPCState *lpc = opaque;
++    return lpc->amd_pmio;
++}
++
++static const VMStateDescription vmstate_ich9_amd_pmio = {
++    .name = "ICH9LPC/amd-pmio",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = ich9_amd_pmio_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT8(amd_pmio_index, ICH9LPCState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static bool ich9_ec_unavailable_needed(void *opaque)
++{
++    ICH9LPCState *lpc = opaque;
++    return lpc->ec_unavailable;
++}
++
++static const VMStateDescription vmstate_ich9_ec_unavailable = {
++    .name = "ICH9LPC/ec-unavailable",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = ich9_ec_unavailable_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT8(ec_remaining, ICH9LPCState),
+         VMSTATE_END_OF_LIST()
+     }
+ };
+@@ -822,11 +957,15 @@
+     .subsections = (const VMStateDescription * const []) {
+         &vmstate_ich9_rst_cnt,
+         &vmstate_ich9_smi_feat,
++        &vmstate_ich9_amd_pmio,
++        &vmstate_ich9_ec_unavailable,
+         NULL
+     }
+ };
+ 
+ static const Property ich9_lpc_properties[] = {
++    DEFINE_PROP_BOOL("ec-unavailable", ICH9LPCState, ec_unavailable, false),
++    DEFINE_PROP_BOOL("amd-pmio", ICH9LPCState, amd_pmio, false),
+     DEFINE_PROP_BOOL("noreboot", ICH9LPCState, pin_strap.spkr_hi, false),
+     DEFINE_PROP_BOOL("smm-compat", ICH9LPCState, pm.smm_compat, false),
+     DEFINE_PROP_BOOL("smm-enabled", ICH9LPCState, pm.smm_enabled, false),
+--- a/include/hw/southbridge/ich9.h
++++ b/include/hw/southbridge/ich9.h
+@@ -34,6 +34,13 @@
+     MC146818RtcState rtc;
+     APMState apm;
+     ICH9LPCPMRegs pm;
++    bool amd_pmio;
++    uint8_t amd_pmio_index;
++    MemoryRegion amd_pmio_io;
++    bool ec_unavailable;
++    uint8_t ec_remaining;
++    MemoryRegion ec_command;
++    MemoryRegion ec_data;
+     uint32_t sci_level; /* track sci level */
+     uint8_t sci_gsi;
+ 
+--- a/target/i386/tcg/system/misc_helper.c
++++ b/target/i386/tcg/system/misc_helper.c
+@@ -333,6 +333,9 @@
+     cpu_svm_check_intercept_param(env, SVM_EXIT_MSR, 0, GETPC());
+ 
+     switch ((uint32_t)env->regs[R_ECX]) {
++    case 0xc0010058: /* AMD MMIO Configuration Base Address */
++        val = x86_cpu->amd_mmconfig_msr;
++        break;
+     case MSR_IA32_SYSENTER_CS:
+         val = env->sysenter_cs;
+         break;
+--- a/target/i386/cpu.h
++++ b/target/i386/cpu.h
+@@ -2152,6 +2152,7 @@
+     VMChangeStateEntry *vmsentry;
+ 
+     uint64_t ucode_rev;
++    uint64_t amd_mmconfig_msr;
+ 
+     uint32_t hyperv_spinlock_attempts;
+     char *hyperv_vendor;
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -8846,6 +8846,7 @@
+     DEFINE_PROP_UINT32("min-xlevel2", X86CPU, env.cpuid_min_xlevel2, 0),
+     DEFINE_PROP_UINT8("avx10-version", X86CPU, env.avx10_version, 0),
+     DEFINE_PROP_UINT64("ucode-rev", X86CPU, ucode_rev, 0),
++    DEFINE_PROP_UINT64("amd-mmconfig-msr", X86CPU, amd_mmconfig_msr, 0),
+     DEFINE_PROP_BOOL("full-cpuid-auto-level", X86CPU, full_cpuid_auto_level, true),
+     DEFINE_PROP_STRING("hv-vendor-id", X86CPU, hyperv_vendor),
+     DEFINE_PROP_BOOL("cpuid-0xb", X86CPU, enable_cpuid_0xb, true),
