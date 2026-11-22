@@ -15,6 +15,9 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 90
 
+    env:
+      MSYS: winsymlinks:nativestrict
+
     defaults:
       run:
         shell: msys2 {0}
